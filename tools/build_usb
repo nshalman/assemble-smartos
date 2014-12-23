@@ -1,0 +1,337 @@
+#!/bin/bash
+# Copyright (c) 2013 Joyent, Inc.
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+#
+# Automates the process of building iso and usb images of a smartos build.
+# It uses the latest platform file that's been built.
+#
+
+shopt -s xpg_echo
+set -o pipefail
+export PATH=/usr/bin:/opt/local/bin:/usr/sbin
+
+bi_arg0=$(basename $0)
+bi_type=${bi_arg0/build_/}
+bi_tmpdir=/tmp/build_$bi_type-$USER.$$
+bi_output_dir="output-$bi_type"
+bi_grub_dir="proto/boot/grub"
+bi_output_grub_dir="$bi_tmpdir/boot/grub"
+bi_grub_files="stage1 stage2"
+bi_archive_path="i86pc/amd64/boot_archive"
+bi_unix_path="i86pc/kernel/amd64/unix"
+bi_platform_dir="output/"
+bi_platform_name=
+bi_platform=
+bi_grub_optstr=
+bi_console=vga
+bi_grub_unit=
+bi_dont_clean=0
+no_smartos=0
+bi_usbpath=
+bi_lofidev=
+
+function usage
+{
+	local msg="$*"
+	[[ -z "$msg" ]] && echo "$msg"
+	cat <<USAGE >&2
+Usage: $bi_arg0 [ -o options ] [-c DEV] [ -k ]
+
+Generate a bootable $bi_type image from the proto area and newest platform directory.
+
+	-o options	Append all the options to every GRUB menu.lst entry
+	-c DEV		Set default console to be DEV (tty{a,b,c,d} or vga)
+	-k		Don't delete temporary files
+	-n		Don't build for SmartOS
+	-h		Display this message
+
+USAGE
+	exit 2
+}
+
+function fail
+{
+	if [[ x"$bi_lofidev" != x ]]; then
+		#(unmount and) cleanup the lofi device
+		pfexec umount -f ${bi_lofidev}:c
+		pfexec lofiadm -d $bi_lofidev
+	fi
+	# an uncompressed usb file is probably incomplete.  remove it
+	[[ -f $bi_usbpath ]] && rm $bi_usbpath
+	local msg="$*"
+	[[ -z "$msg" ]] && msg="failed"
+	echo "$bi_arg0: $msg" >&2
+	exit 1
+}
+
+function bi_verif_mkisofs
+{
+	echo "Checking for mkisofs ... \c "
+	which mkisofs >/dev/null
+	[[ $? -eq 0 ]] || fail "missing mkisofs"
+	echo "done"
+}
+
+function bi_get_build
+{
+	echo "Determining platform... \c "
+	bi_platform_name=$(ls $bi_platform_dir | grep platform | grep -v .tgz | \
+	    sort -r | head -n1)
+	[[ $? -eq 0 ]] || fail "failed to get platform file"
+	[[ -z $bi_platform_name ]] && fail "couldn't find platform file"
+	echo "done"
+	echo "Using platform: $bi_platform_name"
+	bi_platform=$bi_platform_dir$bi_platform_name
+}
+
+#
+# Check to make sure the 64-bit kernel is actually there as a brief sanity check
+#
+function bi_verif_platform
+{
+	echo "Verifying platform... \c "
+	[[ -d $bi_platform ]] || fail "invalid platform directory"
+	[[ -f $bi_platform/$bi_archive_path ]] || fail "missing boot archive"
+	[[ -f $bi_platform/$bi_unix_path ]] || fail "missing kernel image"
+	echo "done"
+}
+
+function bi_verif_grub
+{
+	echo "Verifying grub files... \c "
+	[[ -d $bi_grub_dir ]] || fail "missing /boot/grub from proto area"
+	for file in $bi_grub_files; do
+		[[ -f $bi_grub_dir/$file ]] ||
+		    fail "missing required file from grub proto area: $file"
+	done
+	echo "done"
+}
+
+function bi_verif_console
+{
+	echo "Verifying console selection... \c "
+	case "$bi_console" in
+	text|graphics|vga)
+		bi_console=vga
+		bi_grub_unit=1,0,2,3
+		;;
+	ttya)
+		bi_grub_unit=0,1,2,3
+		;;
+	ttyb)
+		bi_grub_unit=1,0,2,3
+		;;
+	ttyc)
+		bi_grub_unit=2,1,0,3
+		;;
+	ttyd)
+		bi_grub_unit=3,1,0,2
+		;;
+	*)
+		fail "Invalid console device $bi_console"
+		;;
+	esac
+	echo "done"
+}
+
+function bi_generate_usb_file
+{
+	if [[ ! -d $bi_output_dir ]]; then
+		mkdir -p $bi_output_dir > /dev/null
+		[[ $? -eq 0 ]] || fail "failed to make output directory"
+	fi
+	echo "Generating usb image file... \c "
+	bi_usbpath="$bi_output_dir/$bi_platform_name.usb"
+	rm -f $bi_usbpath
+	mkfile -n 2000000000 $bi_usbpath || fail "failed to generate usb file"
+	bi_lofidev=$(pfexec lofiadm -a $bi_usbpath) || fail "failed to create lofi device"
+	pfexec fdisk -F $(dirname $0)/usb_fdisk_table ${bi_lofidev/lofi/rlofi}
+	[[ $? -eq 0 ]] || fail "failed to partition ${bi_lofidev/lofi/rlofi}"
+	echo "y" | pfexec mkfs -F pcfs -o fat=32 ${bi_lofidev/lofi/rlofi}:c
+	[[ $? -eq 0 ]] || fail "failed to format the usb image"
+	echo "done"
+	echo "Mounting usb image file... \c "
+	pfexec mount -F pcfs ${bi_lofidev}:c $bi_tmpdir || fail "failed to mount usb image"
+	echo "done"
+}
+
+function bi_setup_work_dir
+{
+	echo "Creating temporary directory... \c "
+	mkdir $bi_tmpdir >/dev/null
+	[[ $? -eq 0 ]] || fail "failed to make temporary directory"
+	echo "done"
+	if [[ $bi_type == usb ]]; then
+		bi_generate_usb_file
+	fi
+}
+
+function bi_cleanup_work_dir
+{
+	[[ $bi_dont_clean -eq 1 ]] && return
+	echo "Removing temporary directory... \c "
+	[[ ! -d $bi_tmpdir ]] && return
+	rm -rf $bi_tmpdir/*
+	[[ $? -eq 0 ]] || fail "failed to remove temporary directory contents"
+	rmdir $bi_tmpdir
+	[[ $? -eq 0 ]] || fail "failed to remove temporary directory"
+	echo "done"
+}
+
+function bi_copy_contents
+{
+	echo "Copying platform directory... \c "
+	cp -r $bi_platform $bi_tmpdir/platform >/dev/null
+	[[ $? -eq 0 ]] || fail "failed to copy platform file"
+	echo "done"
+	echo "Copying grub components... \c "
+	mkdir -p $bi_output_grub_dir >/dev/null
+	[[ $? -eq 0 ]] || fail "failed to iso9960 grub output directory"
+	for file in $bi_grub_files; do
+		cp $bi_grub_dir/$file $bi_output_grub_dir > /dev/null
+		[[ $? -eq 0 ]] || fail "failed to copy grub file: $file"
+	done
+	echo "done"
+}
+
+function bi_generate_grub_conf
+{
+	if [[ $no_smartos != 1 ]]; then
+		bi_grub_optstr="${bi_grub_optstr},smartos=true"
+	fi
+	local console_settings='console=${os_console},${os_console}-mode="115200,8,n,1,-"'
+	# keep passord and shadow in sync, please
+	local password='root'
+	local shadow='$5$2HOHRnK3$NvLlm.1KQBbB0WjoP7xcIwGnllhzp2HnT.mDO7DpxYA'
+	echo "Generating grub menu.lst... \c "
+	cat > $bi_output_grub_dir/menu.lst <<EOF
+default=0
+timeout=10
+min_mem64 1024
+serial --speed=115200 --unit=$bi_grub_unit --word=8 --parity=no --stop=1
+terminal composite
+variable os_console $bi_console
+
+title SmartOS
+   kernel$ /platform/i86pc/kernel/amd64/unix -B $console_settings,root_shadow='$shadow'$bi_grub_optstr
+   module /platform/i86pc/amd64/boot_archive type=rootfs name=ramdisk
+   module /platform/smartos_prompt_config.sh type=file name=smartos_prompt_config.sh
+
+title SmartOS noinstall/recovery (login/pw: root/$password)
+   kernel$ /platform/i86pc/kernel/amd64/unix -B $console_settings,root_shadow='$shadow',standalone=true,noimport=true
+   module /platform/i86pc/amd64/boot_archive
+
+title SmartOS +kmdb
+   kernel$ /platform/i86pc/kernel/amd64/unix -kd -B $console_settings,root_shadow='$shadow'$bi_grub_optstr
+   module /platform/i86pc/amd64/boot_archive
+EOF
+	[[ $? -eq 0 ]] || fail "failed to create menu.lst"
+	echo "done"
+}
+
+function bi_generate_iso
+{
+	local isopath
+
+	if [[ ! -d $bi_output_dir ]]; then
+		mkdir $bi_output_dir > /dev/null
+		[[ $? -eq 0 ]] || fail "failed to make output directory"
+	fi
+	echo "Generating iso... \c "
+	isopath="$bi_output_dir/$bi_platform_name.iso"
+	LC_ALL=C mkisofs -R -b 		\
+	    boot/grub/stage2_eltorito	\
+	    -no-emul-boot 		\
+	    -boot-load-size 4		\
+	    -boot-info-table		\
+	    -quiet			\
+	    -o 	$isopath		\
+	    $bi_tmpdir/ >/dev/null
+	[[ $? -eq 0 ]] || fail "Failed to create iso"
+	echo "done"
+	echo "iso is available at $(pwd)/$isopath"
+}
+
+
+function bi_generate_usb
+{
+	echo "Installing grub... \c "
+	grub --batch <<____ENDOFGRUBCOMMANDS
+device (hd0) $bi_usbpath
+root (hd0,0)
+setup (hd0)
+quit
+____ENDOFGRUBCOMMANDS
+	[[ $? -eq 0 ]] || fail "failed to install grub"
+	echo "done"
+	pfexec umount ${bi_lofidev}:c || fail "failed to unmount ${bi_lofidev}:c"
+	pfexec lofiadm -d $bi_lofidev || fail "failed to remove lofi device $bi_lofidev"
+	bi_lofidev= #unset that variable so fail won't try to clean it up again
+	echo "usb image is available at $(pwd)/${bi_usbpath}"
+}
+
+while getopts "ko:nhc:" c $@; do
+	case "$c" in
+	o)
+		echo "Building $bi_type image with additional options: $OPTARG"
+		bi_grub_optstr=",$OPTARG"
+		;;
+	c)
+		bi_console="$OPTARG"
+		;;
+	k)
+		bi_dont_clean=1
+		;;
+	n)
+		no_smartos=1
+		;;
+	h)
+		usage
+		;;
+	:)
+		usage "missing required argument -- $OPTARG"
+		;;
+	*)
+		usage "invalid option: $OPTARG"
+		;;
+	esac
+done
+
+#
+# Get us to the root of the workspace
+#
+cd $(dirname $0)
+cd ..
+case "$bi_type" in
+	iso)
+		bi_verif_mkisofs
+		;;
+	usb)
+		;;
+esac
+bi_verif_grub
+bi_verif_console
+bi_get_build
+bi_verif_platform
+bi_setup_work_dir
+bi_copy_contents
+bi_generate_grub_conf
+case "$bi_type" in
+	iso)
+		bi_generate_iso
+		;;
+	usb)
+		bi_generate_usb
+		;;
+esac
+bi_cleanup_work_dir
