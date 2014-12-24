@@ -225,11 +225,13 @@ variable os_console $bi_console
 title SmartOS
    kernel$ /platform/i86pc/kernel/amd64/unix -B $console_settings,root_shadow='$shadow'$bi_grub_optstr
    module /platform/i86pc/amd64/boot_archive type=rootfs name=ramdisk
-   module /platform/smartos_prompt_config.sh type=file name=smartos_prompt_config.sh
+   module /smartos_prompt_config.sh type=file name=smartos_prompt_config.sh
+   module /mount-usb.sh type=file name=mount-usb.sh
 
 title SmartOS noinstall/recovery (login/pw: root/$password)
    kernel$ /platform/i86pc/kernel/amd64/unix -B $console_settings,root_shadow='$shadow',standalone=true,noimport=true
-   module /platform/i86pc/amd64/boot_archive
+   module /platform/i86pc/amd64/boot_archive type=rootfs name=ramdisk
+   module /mount-usb.sh type=file name=mount-usb.sh
 
 title SmartOS +kmdb
    kernel$ /platform/i86pc/kernel/amd64/unix -kd -B $console_settings,root_shadow='$shadow'$bi_grub_optstr
@@ -265,6 +267,13 @@ function bi_generate_iso
 
 function bi_generate_usb
 {
+	echo "Copying extra files to USB image... \c "
+	cp src/* $bi_tmpdir >/dev/null
+	[[ $? -eq 0 ]] || fail "failed to copy extra USB files"
+	echo "done"
+	echo "Marking USB image... \c "
+	touch $bi_tmpdir/.franken-smartos || fail "unable to touch $bi_tmpdir/.franken-smartos"
+	echo "done"
 	echo "Installing grub... \c "
 	grub --batch <<____ENDOFGRUBCOMMANDS
 device (hd0) $bi_usbpath

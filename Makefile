@@ -5,9 +5,9 @@ LATEST_VER=$(shell cut -d "-" -f 2 <<< $(notdir $(LATEST_DIR)))
 
 all: output-usb/platform-$(LATEST_VER).usb
 
-output-usb/platform-$(LATEST_VER).usb: proto/boot/grub output/platform-$(LATEST_VER) Makefile src/smartos_prompt_config.sh
+output-usb/platform-$(LATEST_VER).usb: proto/boot/grub output/platform-$(LATEST_VER) Makefile src/*
 	cp src/smartos_prompt_config.sh output/platform-$(LATEST_VER)/
-	tools/build_usb -o standalone=true
+	tools/build_usb -o standalone=true -c ttya
 	touch $@
 
 proto/boot/grub: downloads/boot-master-$(LATEST_VER).tgz
@@ -29,4 +29,4 @@ downloads/%: downloads
 	touch $@
 
 clean:
-	rm -rf downloads
+	rm -rf output* proto*
